@@ -12,6 +12,8 @@
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
 #include <util/delay.h>
+#include <util/setbaud.h>
+#include <stdio.h>
 
 #define sbi(PORT,BIT) PORT|=_BV(BIT)
 #define cbi(PORT,BIT) PORT&=~_BV(BIT)
@@ -27,11 +29,52 @@ enum IR_PHASE
 volatile uint32_t tc;
 volatile uint16_t code_buf;
 
+void USART_Init()
+{
+	UBRR1H = UBRRH_VALUE;
+	UBRR1L = UBRRL_VALUE;
+	UCSR1B = (1<<RXEN1)|(1<<TXEN1);		// RX,TX
+	UCSR1C = (0<<USBS1)|(3<<UCSZ10);	// Stop:1, Data:8
+}
+
+void USART_Transmit_byte( uint8_t data )
+{
+	while( bit_is_clear(UCSR1A,UDRE1) );
+	UDR1 = data;
+}
+
+void USART_Transmit_bytes( uint8_t *data, int length )
+{
+	for( int i=0; i<length; i++ ){
+		USART_Transmit_byte(*data);
+		data++;
+	}
+}
+
+uint8_t USART_Receive()
+{
+	if( bit_is_clear(UCSR1A,RXC1) ){
+		return 0;
+	}
+	while( bit_is_clear(UCSR1A,RXC1) );
+	return UDR1;
+}
+
 void enable_external_clock()
 {
 	CLKSEL0 |= _BV(EXTE) | _BV(CLKS);
 	CLKPR = _BV(CLKPCE);
 	CLKPR = 0;
+}
+
+void led_blink()
+{
+	for( uint8_t i=0; i<5; i++ ){
+		cbi(PORTB,PINB0);
+		_delay_ms(10);
+		sbi(PORTB,PINB0);
+		_delay_ms(10);
+	}
 }
 
 void num_key( uint8_t num )
@@ -48,46 +91,68 @@ void set_bottle( uint8_t side )
 	uint8_t d1 = 0;
 	for( int i=0; i<4; i++ ){
 		uint8_t c = code % 3 + 1;
-		d0 <<= 2;
-		d1 <<= 2;
-		d0 |= c&1;
-		d1 |= c>>1&1;
-		code %= 3;
+		d0 |= (c&1)<<(2*i);
+		d1 |= ((c>>1)&1)<<(2*i);
+		code /= 3;
+	}
+	// ERROR Code
+	if( code_buf == 0 || code_buf > 162 ){
+		d0 = d1 = 0;
 	}
 	// 
 	uint8_t clk = 0b10101010;
 	uint8_t p0, p1, p2;
 	uint8_t pin0, pin1, pin2;
-	if( code ){
-		p0 = clk; p1 = d0; p2 = d1;
+	if( code_buf <= 81 ){
+		p0 = d1;
+		p1 = d0;
+		p2 = clk;
 	}else{
-		p0 = d0; p1 = d1; p2 = clk;
+		p0 = clk;
+		p1 = d1;
+		p2 = d0;
 	}
+	// Pin
 	if( side ){
 		pin0 = PORTB1, pin1 = PORTB2, pin2 = PORTB3;
 	}else{
 		pin0 = PORTB4, pin1 = PORTB5, pin2 = PORTB6;
 	}
 	// 
-	for( int i=0; i<8; i++ ){
-		if( bit_is_set(p0,i) ){
+	cbi(PORTD,PIND5);
+	// 
+	for( int i=7; i>=0; i-- ){
+		if( p0 & _BV(i) ){
 			sbi(PORTB,pin0);
+			USART_Transmit_byte('o');
 		}else{
 			cbi(PORTB,pin0);
+			USART_Transmit_byte('.');
 		}
-		if( bit_is_set(p1,i) ){
+		if( p1 & _BV(i) ){
 			sbi(PORTB,pin1);
+			USART_Transmit_byte('o');
 		}else{
 			cbi(PORTB,pin1);
+			USART_Transmit_byte('.');
 		}
-		if( bit_is_set(p2,i) ){
+		if( p2 & _BV(i) ){
 			sbi(PORTB,pin2);
+			USART_Transmit_byte('o');
 		}else{
 			cbi(PORTB,pin2);
+			USART_Transmit_byte('.');
 		}
+		USART_Transmit_bytes((uint8_t*)"\r\n",2);
 		// 
 		_delay_ms(20);
 	}
+	// 
+	sbi(PORTD,PIND5);
+	// 0:000
+	uint8_t buf[16];
+	sprintf((char*)buf,"%1d:%03d\r\n",side,code_buf);
+	USART_Transmit_bytes(buf,7);
 }
 
 void ir_command( uint8_t cmd )
@@ -107,26 +172,15 @@ void ir_command( uint8_t cmd )
 		case 0b11100101: num_key(9); break;	// 9
 		default: return;
 	}
-	cbi(PORTB,PINB0);
-	_delay_ms(50);
-	sbi(PORTB,PINB0);
-}
-
-void led_blink()
-{
-	for( uint8_t i=0; i<5; i++ ){
-		cbi(PORTD,PIND5);
-		_delay_ms(20);
-		sbi(PORTD,PIND5);
-		_delay_ms(20);
-	}
+	// 
+	led_blink();
 }
 
 ISR(TIMER0_COMPA_vect)
 {
 	tc += 50;
 	if( tc > 60000000 ){
-		sleep_mode();
+//		sleep_mode();
 	}
 }
 
@@ -187,6 +241,9 @@ ISR(INT0_vect)
 int main(void)
 {
 	enable_external_clock();
+	// 
+	USART_Init();
+	// 
 	// Pin Direction (0:IN,1:OUT)
 	DDRB = _BV(PINB0)|_BV(PINB1)|_BV(PINB2)|_BV(PINB3)|_BV(PINB4)|_BV(PINB5)|_BV(PINB6);
 	DDRD = _BV(PIND5);
@@ -209,9 +266,22 @@ int main(void)
 	// 
 	led_blink();
 	// 
+	USART_Transmit_bytes((uint8_t*)"HELLO\r\n",7);
+	// 
 	while(1)
 	{
-
+		uint8_t c = USART_Receive();
+		// 
+		if( c ){
+			if( c >= '0' && c <= '9' ){
+				num_key(c-'0');
+				led_blink();
+			}else if( c == 'l' ){
+				set_bottle(0);
+			}else if( c == 'r' ){
+				set_bottle(1);
+			}
+		}
 	}
 }
 
